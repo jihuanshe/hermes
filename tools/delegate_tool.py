@@ -175,6 +175,11 @@ def _run_single_child(
     model on OpenRouter while the parent runs on Nous Portal).
     """
     from run_agent import AIAgent
+    import model_tools
+
+    # Save the parent's resolved tool names before the child agent can
+    # overwrite the process-global via get_tool_definitions().
+    _saved_tool_names = list(model_tools._last_resolved_tool_names)
 
     child_start = time.monotonic()
 
@@ -352,6 +357,10 @@ def _run_single_child(
         }
 
     finally:
+        # Restore the parent's tool names so the process-global is correct
+        # for any subsequent execute_code calls or other consumers.
+        model_tools._last_resolved_tool_names = _saved_tool_names
+
         # Unregister child from interrupt propagation
         if hasattr(parent_agent, '_active_children'):
             try:
