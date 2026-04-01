@@ -62,6 +62,7 @@ class Platform(Enum):
     API_SERVER = "api_server"
     WEBHOOK = "webhook"
     FEISHU = "feishu"
+    FEISHU_CLI = "feishu_cli"
     WECOM = "wecom"
     WECOM_CALLBACK = "wecom_callback"
     WEIXIN = "weixin"
@@ -1004,6 +1005,31 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 platform=Platform.FEISHU,
                 chat_id=feishu_home,
                 name=os.getenv("FEISHU_HOME_CHANNEL_NAME", "Home"),
+            )
+
+    # Feishu CLI (lark-cli based adapter)
+    feishu_cli_enabled = os.getenv("FEISHU_CLI_ENABLED", "").lower() in ("true", "1", "yes")
+    if feishu_cli_enabled:
+        if Platform.FEISHU_CLI not in config.platforms:
+            config.platforms[Platform.FEISHU_CLI] = PlatformConfig()
+        config.platforms[Platform.FEISHU_CLI].enabled = True
+        feishu_cli_extra: Dict[str, str] = {}
+        # Optional overrides — lark-cli uses its own config by default
+        if feishu_app_id:
+            feishu_cli_extra["app_id"] = feishu_app_id
+        if feishu_app_secret:
+            feishu_cli_extra["app_secret"] = feishu_app_secret
+        bot_open_id = os.getenv("FEISHU_BOT_OPEN_ID", "")
+        if bot_open_id:
+            feishu_cli_extra["bot_open_id"] = bot_open_id
+        if feishu_cli_extra:
+            config.platforms[Platform.FEISHU_CLI].extra.update(feishu_cli_extra)
+        feishu_cli_home = os.getenv("FEISHU_CLI_HOME_CHANNEL") or os.getenv("FEISHU_HOME_CHANNEL")
+        if feishu_cli_home:
+            config.platforms[Platform.FEISHU_CLI].home_channel = HomeChannel(
+                platform=Platform.FEISHU_CLI,
+                chat_id=feishu_cli_home,
+                name=os.getenv("FEISHU_CLI_HOME_CHANNEL_NAME", os.getenv("FEISHU_HOME_CHANNEL_NAME", "Home")),
             )
 
     # WeCom (Enterprise WeChat)

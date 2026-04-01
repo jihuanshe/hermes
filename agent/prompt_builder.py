@@ -364,6 +364,13 @@ PLATFORM_HINTS = {
         "documents. You can also include image URLs in markdown format ![alt](url) and they "
         "will be downloaded and sent as native media when possible."
     ),
+    "feishu_cli": (
+        "You are on Feishu/Lark, an enterprise communication platform. "
+        "Feishu supports markdown formatting. You can send media files natively: "
+        "include MEDIA:/absolute/path/to/file in your response. Images (.jpg, "
+        ".png) appear as photos, audio (.ogg, .mp3) as audio messages, and other "
+        "files arrive as downloadable documents."
+    ),
 }
 
 # ---------------------------------------------------------------------------

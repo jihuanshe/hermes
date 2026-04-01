@@ -248,6 +248,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         "homeassistant": Platform.HOMEASSISTANT,
         "dingtalk": Platform.DINGTALK,
         "feishu": Platform.FEISHU,
+        "feishu_cli": Platform.FEISHU_CLI,
         "wecom": Platform.WECOM,
         "wecom_callback": Platform.WECOM_CALLBACK,
         "weixin": Platform.WEIXIN,

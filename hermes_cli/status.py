@@ -301,6 +301,7 @@ def show_status(args):
         "SMS": ("TWILIO_ACCOUNT_SID", "SMS_HOME_CHANNEL"),
         "DingTalk": ("DINGTALK_CLIENT_ID", None),
         "Feishu": ("FEISHU_APP_ID", "FEISHU_HOME_CHANNEL"),
+        "Feishu CLI": ("FEISHU_CLI_ENABLED", "FEISHU_CLI_HOME_CHANNEL"),
         "WeCom": ("WECOM_BOT_ID", "WECOM_HOME_CHANNEL"),
         "WeCom Callback": ("WECOM_CALLBACK_CORP_ID", None),
         "Weixin": ("WEIXIN_ACCOUNT_ID", "WEIXIN_HOME_CHANNEL"),

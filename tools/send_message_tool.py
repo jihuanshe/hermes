@@ -157,6 +157,7 @@ def _handle_send(args):
         "homeassistant": Platform.HOMEASSISTANT,
         "dingtalk": Platform.DINGTALK,
         "feishu": Platform.FEISHU,
+        "feishu_cli": Platform.FEISHU_CLI,
         "wecom": Platform.WECOM,
         "wecom_callback": Platform.WECOM_CALLBACK,
         "weixin": Platform.WEIXIN,
@@ -233,7 +234,7 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         match = _TELEGRAM_TOPIC_TARGET_RE.fullmatch(target_ref)
         if match:
             return match.group(1), match.group(2), True
-    if platform_name == "feishu":
+    if platform_name in ("feishu", "feishu_cli"):
         match = _FEISHU_TARGET_RE.fullmatch(target_ref)
         if match:
             return match.group(1), match.group(2), True
@@ -334,6 +335,13 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     except ImportError:
         _feishu_available = False
 
+    # Feishu CLI adapter is optional (requires lark-cli)
+    try:
+        from gateway.platforms.feishu_cli import FeishuCliAdapter
+        _feishu_cli_available = True
+    except ImportError:
+        _feishu_cli_available = False
+
     media_files = media_files or []
 
     if platform == Platform.SLACK and message:
@@ -351,6 +359,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     }
     if _feishu_available:
         _MAX_LENGTHS[Platform.FEISHU] = FeishuAdapter.MAX_MESSAGE_LENGTH
+    if _feishu_cli_available:
+        _MAX_LENGTHS[Platform.FEISHU_CLI] = FeishuCliAdapter.MAX_MESSAGE_LENGTH
 
     # Smart-chunk the message to fit within platform limits.
     # For short messages or platforms without a known limit this is a no-op.
