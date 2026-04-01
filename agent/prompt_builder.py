@@ -256,6 +256,13 @@ PLATFORM_HINTS = {
         "only — no markdown, no formatting. SMS messages are limited to ~1600 "
         "characters, so be brief and direct."
     ),
+    "feishu_cli": (
+        "You are on Feishu/Lark, an enterprise communication platform. "
+        "Feishu supports markdown formatting. You can send media files natively: "
+        "include MEDIA:/absolute/path/to/file in your response. Images (.jpg, "
+        ".png) appear as photos, audio (.ogg, .mp3) as audio messages, and other "
+        "files arrive as downloadable documents."
+    ),
 }
 
 CONTEXT_FILE_MAX_CHARS = 20_000
