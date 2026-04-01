@@ -142,6 +142,7 @@ PLATFORMS = {
     "matrix":   {"label": "💬 Matrix",     "default_toolset": "hermes-matrix"},
  "dingtalk": {"label": "💬 DingTalk", "default_toolset": "hermes-dingtalk"},
     "feishu": {"label": "🪽 Feishu", "default_toolset": "hermes-feishu"},
+    "feishu_cli": {"label": "🪽 Feishu CLI", "default_toolset": "hermes-feishu-cli"},
     "wecom": {"label": "💬 WeCom", "default_toolset": "hermes-wecom"},
     "api_server": {"label": "🌐 API Server", "default_toolset": "hermes-api-server"},
     "mattermost": {"label": "💬 Mattermost", "default_toolset": "hermes-mattermost"},

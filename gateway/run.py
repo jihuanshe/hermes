@@ -1533,6 +1533,13 @@ class GatewayRunner:
                 return None
             return FeishuAdapter(config)
 
+        elif platform == Platform.FEISHU_CLI:
+            from gateway.platforms.feishu_cli import FeishuCliAdapter, check_feishu_cli_requirements
+            if not check_feishu_cli_requirements():
+                logger.warning("Feishu CLI: lark-cli not found on $PATH. Install from https://github.com/larksuite/cli")
+                return None
+            return FeishuCliAdapter(config)
+
         elif platform == Platform.WECOM:
             from gateway.platforms.wecom import WeComAdapter, check_wecom_requirements
             if not check_wecom_requirements():
@@ -1607,6 +1614,7 @@ class GatewayRunner:
             Platform.MATRIX: "MATRIX_ALLOWED_USERS",
             Platform.DINGTALK: "DINGTALK_ALLOWED_USERS",
             Platform.FEISHU: "FEISHU_ALLOWED_USERS",
+            Platform.FEISHU_CLI: "FEISHU_ALLOWED_USERS",
             Platform.WECOM: "WECOM_ALLOWED_USERS",
         }
         platform_allow_all_map = {
@@ -1621,6 +1629,7 @@ class GatewayRunner:
             Platform.MATRIX: "MATRIX_ALLOW_ALL_USERS",
             Platform.DINGTALK: "DINGTALK_ALLOW_ALL_USERS",
             Platform.FEISHU: "FEISHU_ALLOW_ALL_USERS",
+            Platform.FEISHU_CLI: "FEISHU_ALLOW_ALL_USERS",
             Platform.WECOM: "WECOM_ALLOW_ALL_USERS",
         }
 
