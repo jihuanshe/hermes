@@ -36,10 +36,7 @@ import logging
 import os
 import random
 import shutil
-import tempfile
 import time
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -56,11 +53,25 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
-    cache_audio_from_bytes,
-    cache_document_from_bytes,
-    cache_image_from_bytes,
     cache_image_from_url,
 )
+from gateway.platforms.feishu.acl.cli_mapper import CliToDomainMapper
+from gateway.platforms.feishu.application.gateway_mapper import (
+    domain_to_message_event,
+    domain_to_message_type,
+)
+from gateway.platforms.feishu.application.service import FeishuInboundService
+from gateway.platforms.feishu.config import FeishuAdapterConfig
+from gateway.platforms.feishu.domain.content import (
+    AudioContent,
+    FileContent,
+    ImageContent,
+    VideoContent,
+)
+from gateway.platforms.feishu.domain.services import InboundMessagePolicy
+from gateway.platforms.feishu.domain.value_objects import BotIdentity
+from gateway.platforms.feishu.infrastructure.lark_cli_client import LarkCliClient
+from gateway.platforms.feishu_dedup import MessageDeduplicator
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +80,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 MAX_MESSAGE_LENGTH = 4000
-DEDUP_WINDOW_SECONDS = 300
-DEDUP_MAX_SIZE = 1000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
+SENDER_NAME_TTL_SECONDS = 24 * 60 * 60  # 24 hours — names rarely change
 _ACK_EMOJIS = ["OnIt", "Get", "OneSecond", "Typing", "GLANCE"]
 
 # Map lark-cli message_type to our MessageType enum
@@ -84,6 +94,7 @@ _MESSAGE_TYPE_MAP: Dict[str, MessageType] = {
     "video": MessageType.VIDEO,
     "sticker": MessageType.STICKER,
     "interactive": MessageType.TEXT,
+    "merge_forward": MessageType.TEXT,
 }
 
 
@@ -170,18 +181,31 @@ class FeishuCliAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.FEISHU_CLI)
 
-        extra = config.extra or {}
-        self._app_id: str = extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")
-        self._app_secret: str = extra.get("app_secret") or os.getenv("FEISHU_APP_SECRET", "")
-        self._bot_open_id: str = extra.get("bot_open_id") or os.getenv("FEISHU_BOT_OPEN_ID", "")
+        self._cfg = FeishuAdapterConfig.from_platform(config.extra)
+        self._bot_open_id: str = self._cfg.bot.open_id
+        self._bot_name: str = self._cfg.bot.name
 
         self._subscribe_proc: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task] = None
 
-        # Message deduplication: msg_id -> timestamp
-        self._seen_messages: Dict[str, float] = {}
+        # Message deduplication (staleness + message-ID + content fingerprint)
+        self._deduplicator = MessageDeduplicator(self._cfg.dedup)
         # ACK reaction tracking: message_id -> reaction_id
         self._pending_reactions: Dict[str, str] = {}
+        # Sender name cache: open_id -> (display_name, expire_at)
+        self._sender_name_cache: Dict[str, tuple[str, float]] = {}
+
+        # DDD pipeline: inbound service + CLI client
+        bot_identity = BotIdentity(
+            open_id=self._cfg.bot.open_id,
+            name=self._cfg.bot.name,
+        )
+        self._cli_client = LarkCliClient(name=self.name)
+        self._inbound_service = FeishuInboundService(
+            mapper=CliToDomainMapper(),
+            policy=InboundMessagePolicy(bot_identity),
+            deduplicator=self._deduplicator,
+        )
 
     # -- Connection lifecycle -----------------------------------------------
 
@@ -205,14 +229,43 @@ class FeishuCliAdapter(BasePlatformAdapter):
             )
             # Don't hard-fail — the subscribe command itself will error if config is bad
 
+        # Auto-detect bot name and open_id from /bot/v3/info if not configured
+        if not self._bot_name or not self._bot_open_id:
+            await self._fetch_bot_info()
+
         try:
             self._reader_task = asyncio.create_task(self._subscribe_loop())
             self._mark_connected()
-            logger.info("[%s] Connected via lark-cli event subscribe", self.name)
+            logger.info("[%s] Connected via lark-cli event subscribe (bot=%s)",
+                        self.name, self._bot_name or "unknown")
             return True
         except Exception as e:
             logger.error("[%s] Failed to connect: %s", self.name, e)
             return False
+
+    async def _fetch_bot_info(self) -> None:
+        """Fetch bot name and open_id via /bot/v3/info API."""
+        info = await self._cli_client.fetch_bot_info()
+        if not info:
+            logger.warning("[%s] Failed to fetch bot info", self.name)
+            return
+        if not self._bot_open_id and info.get("open_id"):
+            self._bot_open_id = info["open_id"]
+        if not self._bot_name and info.get("app_name"):
+            self._bot_name = info["app_name"]
+        logger.info("[%s] Bot info: name=%s, open_id=%s",
+                    self.name, self._bot_name, self._bot_open_id)
+
+        # Refresh inbound service with updated bot identity
+        bot_identity = BotIdentity(
+            open_id=self._bot_open_id,
+            name=self._bot_name,
+        )
+        self._inbound_service = FeishuInboundService(
+            mapper=CliToDomainMapper(),
+            policy=InboundMessagePolicy(bot_identity),
+            deduplicator=self._deduplicator,
+        )
 
     async def _subscribe_loop(self) -> None:
         """Spawn the subscribe subprocess with auto-reconnection on failure."""
@@ -241,6 +294,7 @@ class FeishuCliAdapter(BasePlatformAdapter):
             "lark-cli", "event", "+subscribe",
             "--event-types", "im.message.receive_v1",
             "--compact", "--quiet",
+            "--as", "bot",
         ]
         logger.debug("[%s] Starting subscribe: %s", self.name, " ".join(cmd))
 
@@ -312,7 +366,7 @@ class FeishuCliAdapter(BasePlatformAdapter):
             self._reader_task = None
 
         self._subscribe_proc = None
-        self._seen_messages.clear()
+        self._deduplicator.clear()
         logger.info("[%s] Disconnected", self.name)
 
     # -- Inbound message processing -----------------------------------------
@@ -320,196 +374,92 @@ class FeishuCliAdapter(BasePlatformAdapter):
     async def _on_event(self, data: Dict[str, Any]) -> None:
         """Process a single NDJSON event from lark-cli subscribe.
 
-        Compact format fields:
-            type, id, message_id, chat_id, chat_type, message_type,
-            content, sender_id, create_time, timestamp
+        Delegates parsing, policy, and dedup to the DDD inbound service.
+        Handles media download and sender name resolution (IO), then
+        builds a framework ``MessageEvent`` and dispatches it.
         """
-        event_type = data.get("type", "")
-        if event_type != "im.message.receive_v1":
-            logger.debug("[%s] Ignoring event type: %s", self.name, event_type)
+        result = self._inbound_service.process_raw_event(data)
+        if result.filtered:
+            logger.debug("[%s] Filtered: %s", self.name, result.filter_reason)
             return
 
-        msg_id = data.get("message_id") or data.get("id") or ""
-        if not msg_id:
-            return
+        message = result.message
+        assert message is not None  # guaranteed when not filtered
 
-        # Filter self-messages (prevent reply loops)
-        sender_id = data.get("sender_id", "")
-        if self._bot_open_id and sender_id == self._bot_open_id:
-            logger.debug("[%s] Ignoring self-message %s", self.name, msg_id)
-            return
-
-        if self._is_duplicate(msg_id):
-            logger.debug("[%s] Duplicate message %s, skipping", self.name, msg_id)
-            return
-
-        raw_type = data.get("message_type", "text")
-        content_str = data.get("content", "")
-        chat_id = data.get("chat_id", "")
-        chat_type_raw = data.get("chat_type", "p2p")
-
-        # Parse content — may be plain text or JSON depending on type
-        text = self._extract_text(raw_type, content_str)
-
-        # Determine message type and handle media
-        message_type = _MESSAGE_TYPE_MAP.get(raw_type, MessageType.TEXT)
+        msg_id = str(message.message_id)
+        text = message.content.text
         media_urls: List[str] = []
         media_types: List[str] = []
 
-        if raw_type == "image":
-            # Try to download inbound image for vision tool
-            file_key = self._extract_file_key(content_str, "image_key")
-            if file_key and msg_id:
-                cached = await self._download_resource(msg_id, file_key, ext=".jpg")
-                if cached:
-                    media_urls.append(cached)
-                    media_types.append("image")
-            if not text:
-                text = "[Image]"
-
-        elif raw_type == "file":
-            file_key = self._extract_file_key(content_str, "file_key")
-            file_name = self._extract_field(content_str, "file_name") or "attachment"
-            if file_key and msg_id:
-                ext = Path(file_name).suffix or ".bin"
-                cached = await self._download_resource(msg_id, file_key, ext=ext, filename=file_name)
-                if cached:
-                    media_urls.append(cached)
-                    media_types.append("document")
-            if not text:
-                text = f"[File: {file_name}]"
-
-        elif raw_type == "audio":
-            file_key = self._extract_file_key(content_str, "file_key")
-            if file_key and msg_id:
-                cached = await self._download_resource(msg_id, file_key, ext=".ogg")
-                if cached:
-                    media_urls.append(cached)
-                    media_types.append("audio")
-            if not text:
-                text = "[Audio]"
-
-        elif raw_type == "video":
-            file_key = self._extract_file_key(content_str, "file_key")
-            if file_key and msg_id:
-                cached = await self._download_resource(msg_id, file_key, ext=".mp4")
-                if cached:
-                    media_urls.append(cached)
-                    media_types.append("video")
-            if not text:
-                text = "[Video]"
-
-        elif raw_type == "sticker":
-            if not text:
-                text = "[Sticker]"
+        # Media download based on content kind
+        if isinstance(message.content, ImageContent):
+            cached = await self._download_resource(msg_id, message.content.image_key, ext=".jpg")
+            if cached:
+                media_urls.append(cached)
+                media_types.append("image")
+        elif isinstance(message.content, FileContent):
+            fn = message.content.file_name
+            ext = Path(fn).suffix or ".bin"
+            cached = await self._download_resource(msg_id, message.content.file_key, ext=ext, filename=fn)
+            if cached:
+                media_urls.append(cached)
+                media_types.append("document")
+        elif isinstance(message.content, AudioContent):
+            cached = await self._download_resource(msg_id, message.content.file_key, ext=".ogg")
+            if cached:
+                media_urls.append(cached)
+                media_types.append("audio")
+        elif isinstance(message.content, VideoContent):
+            cached = await self._download_resource(msg_id, message.content.file_key, ext=".mp4")
+            if cached:
+                media_urls.append(cached)
+                media_types.append("video")
 
         if not text and not media_urls:
             logger.debug("[%s] Empty message %s, skipping", self.name, msg_id)
             return
 
-        # Parse timestamp
-        create_time = data.get("create_time") or data.get("timestamp")
-        try:
-            timestamp = datetime.fromtimestamp(
-                int(create_time) / 1000, tz=timezone.utc
-            ) if create_time else datetime.now(tz=timezone.utc)
-        except (ValueError, OSError, TypeError):
-            timestamp = datetime.now(tz=timezone.utc)
-
-        chat_type = "group" if chat_type_raw == "group" else "dm"
+        sender_name = await self._resolve_sender_name(message.sender.open_id)
+        message_type = domain_to_message_type(message)
 
         source = self.build_source(
-            chat_id=chat_id,
-            chat_type=chat_type,
-            user_id=sender_id,
+            chat_id=str(message.conversation.chat_id),
+            chat_type=message.conversation.chat_type,
+            user_id=message.sender.open_id,
+            user_name=sender_name,
+            thread_id=message.conversation.thread_id,
         )
 
-        event = MessageEvent(
+        event = domain_to_message_event(
+            message,
             text=text,
             message_type=message_type,
             source=source,
-            message_id=msg_id,
-            raw_message=data,
+            sender_name=sender_name,
             media_urls=media_urls,
             media_types=media_types,
-            timestamp=timestamp,
+            raw_message=data,
         )
 
         logger.debug(
             "[%s] Message from %s in %s (%s): %s",
-            self.name, sender_id[:12], chat_id[:12] if chat_id else "?", raw_type, text[:50],
+            self.name, message.sender.open_id[:12],
+            str(message.conversation.chat_id)[:12],
+            message.content.kind, text[:50],
         )
         await self.handle_message(event)
+
+    # -- Backward-compat static helpers (used by tests) ---------------------
 
     @staticmethod
     def _extract_text(raw_type: str, content: str) -> str:
         """Extract plain text from lark-cli compact event content.
 
-        For text messages, content is the raw text string.
-        For post messages, it may be JSON with nested content blocks.
-        For interactive (card) messages, extract text or title fields.
+        Retained for backward compatibility — delegates to ``CliToDomainMapper``.
         """
-        if not content:
-            return ""
-
-        # In compact mode, text messages have content as plain string
-        if raw_type == "text":
-            # Sometimes content is JSON like {"text": "hello"}
-            try:
-                parsed = json.loads(content)
-                if isinstance(parsed, dict):
-                    return parsed.get("text", content).strip()
-            except (json.JSONDecodeError, AttributeError):
-                pass
-            return content.strip()
-
-        if raw_type == "post":
-            try:
-                parsed = json.loads(content)
-                if isinstance(parsed, dict):
-                    # Post content has locale keys like zh_cn, en_us
-                    for locale in ("zh_cn", "en_us", "ja_jp"):
-                        locale_data = parsed.get(locale)
-                        if not locale_data:
-                            continue
-                        parts: List[str] = []
-                        title = locale_data.get("title", "")
-                        if title:
-                            parts.append(title)
-                        for paragraph in locale_data.get("content", []):
-                            for element in paragraph:
-                                tag = element.get("tag", "")
-                                if tag == "text":
-                                    parts.append(element.get("text", ""))
-                                elif tag == "a":
-                                    parts.append(element.get("text", element.get("href", "")))
-                                elif tag == "at":
-                                    parts.append(f"@{element.get('user_name', element.get('user_id', ''))}")
-                        if parts:
-                            return "\n".join(parts).strip()
-            except (json.JSONDecodeError, AttributeError):
-                pass
-            return content.strip()
-
-        if raw_type == "interactive":
-            try:
-                parsed = json.loads(content)
-                if isinstance(parsed, dict):
-                    # Try title or text from card config
-                    title = parsed.get("header", {}).get("title", {}).get("content", "")
-                    if title:
-                        return title.strip()
-                    # Fallback to first text element
-                    elements = parsed.get("elements", [])
-                    for el in elements:
-                        text_val = el.get("text", {}).get("content", "") if isinstance(el.get("text"), dict) else el.get("content", "")
-                        if text_val:
-                            return text_val.strip()
-            except (json.JSONDecodeError, AttributeError):
-                pass
-            return "[Interactive message]"
-
-        return content.strip()
+        mapper = CliToDomainMapper()
+        built = mapper._build_content(raw_type, content)
+        return built.text
 
     @staticmethod
     def _extract_file_key(content: str, key_name: str) -> str:
@@ -542,49 +492,9 @@ class FeishuCliAdapter(BasePlatformAdapter):
         filename: Optional[str] = None,
     ) -> Optional[str]:
         """Download a message resource via lark-cli and cache it locally."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            out_path = Path(tmpdir) / f"resource{ext}"
-            rc, stdout, stderr = await _run_cli(
-                [
-                    "im", "+messages-resources-download",
-                    "--message-id", message_id,
-                    "--file-key", file_key,
-                    "--output", str(out_path),
-                ],
-                timeout=60.0,
-            )
-            if rc != 0 or not out_path.exists():
-                logger.warning(
-                    "[%s] Failed to download resource %s: %s",
-                    self.name, file_key, stderr.strip()[:200],
-                )
-                return None
-
-            data = out_path.read_bytes()
-            if not data:
-                return None
-
-            # Cache based on media type
-            if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"):
-                return cache_image_from_bytes(data, ext)
-            elif ext in (".ogg", ".mp3", ".wav", ".m4a", ".opus"):
-                return cache_audio_from_bytes(data, ext)
-            else:
-                return cache_document_from_bytes(data, filename or f"resource{ext}")
-
-    # -- Deduplication ------------------------------------------------------
-
-    def _is_duplicate(self, msg_id: str) -> bool:
-        """Check and record a message ID. Returns True if already seen."""
-        now = time.time()
-        if len(self._seen_messages) > DEDUP_MAX_SIZE:
-            cutoff = now - DEDUP_WINDOW_SECONDS
-            self._seen_messages = {k: v for k, v in self._seen_messages.items() if v > cutoff}
-
-        if msg_id in self._seen_messages:
-            return True
-        self._seen_messages[msg_id] = now
-        return False
+        return await self._cli_client.download_resource(
+            message_id, file_key, ext=ext, filename=filename,
+        )
 
     # -- Outbound messaging -------------------------------------------------
 
@@ -607,12 +517,14 @@ class FeishuCliAdapter(BasePlatformAdapter):
                 "im", "+messages-reply",
                 "--message-id", reply_to,
                 "--text", content,
+                "--as", "bot",
             ]
         else:
             args = [
                 "im", "+messages-send",
                 "--chat-id", chat_id,
                 "--text", content,
+                "--as", "bot",
             ]
 
         rc, stdout, stderr = await _run_cli(args)
@@ -727,12 +639,14 @@ class FeishuCliAdapter(BasePlatformAdapter):
                 "im", "+messages-reply",
                 "--message-id", reply_to,
                 flag, file_path,
+                "--as", "bot",
             ]
         else:
             args = [
                 "im", "+messages-send",
                 "--chat-id", chat_id,
                 flag, file_path,
+                "--as", "bot",
             ]
 
         rc, stdout, stderr = await _run_cli(args, timeout=120.0)
@@ -759,6 +673,7 @@ class FeishuCliAdapter(BasePlatformAdapter):
                 "msg_type": "text",
                 "content": json.dumps({"text": content[:self.MAX_MESSAGE_LENGTH]}),
             }),
+            "--as", "bot",
         ])
         if rc != 0:
             error_msg = stderr.strip()[:200] or f"lark-cli exit code {rc}"
@@ -770,6 +685,7 @@ class FeishuCliAdapter(BasePlatformAdapter):
         rc, stdout, stderr = await _run_cli([
             "api", "GET",
             f"/open-apis/im/v1/chats/{chat_id}",
+            "--as", "bot",
         ], timeout=15.0)
 
         if rc == 0:
@@ -788,6 +704,28 @@ class FeishuCliAdapter(BasePlatformAdapter):
         """Feishu supports markdown natively — pass through."""
         return content
 
+    # -- Sender name resolution --------------------------------------------
+
+    async def _resolve_sender_name(self, sender_id: str) -> Optional[str]:
+        """Resolve an open_id to a display name via lark-cli contact, with 24h cache."""
+        if not sender_id:
+            return None
+
+        now = time.time()
+        cached = self._sender_name_cache.get(sender_id)
+        if cached is not None:
+            name, expire_at = cached
+            if now < expire_at:
+                return name
+
+        name = await self._cli_client.resolve_sender_name(sender_id)
+        if name:
+            self._sender_name_cache[sender_id] = (name, now + SENDER_NAME_TTL_SECONDS)
+            return name
+
+        logger.debug("[%s] Could not resolve name for %s", self.name, sender_id[:16])
+        return None
+
     # -- Processing lifecycle hooks -----------------------------------------
 
     async def on_processing_start(self, event: MessageEvent) -> None:
@@ -803,17 +741,7 @@ class FeishuCliAdapter(BasePlatformAdapter):
     async def _add_ack_reaction(self, message_id: str) -> None:
         """Add a random emoji reaction to signal the message was received."""
         emoji = random.choice(_ACK_EMOJIS)
-        rc, stdout, stderr = await _run_cli([
-            "api", "POST",
-            f"/open-apis/im/v1/messages/{message_id}/reactions",
-            "--data", json.dumps({"reaction_type": {"emoji_type": emoji}}),
-            "--as", "bot",
-        ], timeout=10.0)
-        if rc != 0:
-            logger.warning("[%s] ACK reaction failed for %s: %s", self.name, message_id, stderr.strip()[:200])
-            return
-        result = _parse_cli_json(stdout)
-        reaction_id = result.get("reaction_id", "") if result else ""
+        reaction_id = await self._cli_client.add_reaction(message_id, emoji)
         if reaction_id:
             self._pending_reactions[message_id] = reaction_id
 
@@ -822,10 +750,4 @@ class FeishuCliAdapter(BasePlatformAdapter):
         reaction_id = self._pending_reactions.pop(message_id, "")
         if not reaction_id:
             return
-        rc, _, stderr = await _run_cli([
-            "api", "DELETE",
-            f"/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}",
-            "--as", "bot",
-        ], timeout=10.0)
-        if rc != 0:
-            logger.warning("[%s] Remove ACK reaction failed for %s: %s", self.name, message_id, stderr.strip()[:200])
+        await self._cli_client.remove_reaction(message_id, reaction_id)
