@@ -2,6 +2,7 @@
 
 import json
 import asyncio
+import time
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
@@ -14,6 +15,11 @@ from gateway.platforms.feishu_cli import (
 )
 from gateway.platforms.base import MessageType, SendResult
 from gateway.config import PlatformConfig, Platform
+
+
+def _recent_create_time() -> str:
+    """Return a create_time string (ms epoch) that is recent enough to pass staleness filter."""
+    return str(int(time.time() * 1000))
 
 
 @pytest.fixture
@@ -130,10 +136,15 @@ def test_extract_field():
 # Deduplication
 # ---------------------------------------------------------------------------
 
-def test_dedup(adapter):
-    assert adapter._is_duplicate("msg_1") is False
-    assert adapter._is_duplicate("msg_1") is True
-    assert adapter._is_duplicate("msg_2") is False
+def test_dedup_via_deduplicator(adapter):
+    """Dedup is now handled by the MessageDeduplicator on the adapter."""
+    from gateway.platforms.feishu_dedup import FeishuMessageIdentity
+    ts = int(time.time() * 1000)
+    msg1 = FeishuMessageIdentity(message_id="msg_1", sender_id="ou_u", content="hi", create_time_ms=ts)
+    msg2 = FeishuMessageIdentity(message_id="msg_2", sender_id="ou_u", content="bye", create_time_ms=ts)
+    assert not adapter._deduplicator.check_and_record(msg1).should_drop
+    assert adapter._deduplicator.check_and_record(msg1).should_drop
+    assert not adapter._deduplicator.check_and_record(msg2).should_drop
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +162,7 @@ async def test_self_message_filtered(adapter):
         "message_type": "text",
         "content": "echo",
         "sender_id": "ou_bot123",  # matches bot_open_id
-        "create_time": "1700000000000",
+        "create_time": _recent_create_time(),
     }
     adapter.handle_message = AsyncMock()
     await adapter._on_event(event)
@@ -169,7 +180,7 @@ async def test_normal_message_dispatched(adapter):
         "message_type": "text",
         "content": "Hello bot",
         "sender_id": "ou_user456",
-        "create_time": "1700000000000",
+        "create_time": _recent_create_time(),
     }
     adapter.handle_message = AsyncMock()
     await adapter._on_event(event)
@@ -182,16 +193,16 @@ async def test_normal_message_dispatched(adapter):
 
 @pytest.mark.asyncio
 async def test_group_message_chat_type(adapter):
-    """Group messages should have chat_type='group'."""
+    """Group messages with @mention should have chat_type='group'."""
     event = {
         "type": "im.message.receive_v1",
         "message_id": "om_grp1",
         "chat_id": "oc_group",
         "chat_type": "group",
         "message_type": "text",
-        "content": "Hey",
+        "content": "Hey @bot ou_bot123",  # include bot_open_id for mention gating
         "sender_id": "ou_user789",
-        "create_time": "1700000000000",
+        "create_time": _recent_create_time(),
     }
     adapter.handle_message = AsyncMock()
     await adapter._on_event(event)
@@ -205,6 +216,7 @@ async def test_group_message_chat_type(adapter):
 
 @pytest.mark.asyncio
 async def test_duplicate_event_filtered(adapter):
+    ct = _recent_create_time()
     event = {
         "type": "im.message.receive_v1",
         "message_id": "om_dup",
@@ -213,7 +225,7 @@ async def test_duplicate_event_filtered(adapter):
         "message_type": "text",
         "content": "First",
         "sender_id": "ou_user",
-        "create_time": "1700000000000",
+        "create_time": ct,
     }
     adapter.handle_message = AsyncMock()
     await adapter._on_event(event)
@@ -245,7 +257,7 @@ async def test_send_text(adapter):
         assert result.success is True
         assert result.message_id == "om_resp"
         args = mock_cli.call_args[0][0]
-        assert args == ["im", "+messages-send", "--chat-id", "oc_chat", "--text", "Hello!"]
+        assert args == ["im", "+messages-send", "--chat-id", "oc_chat", "--text", "Hello!", "--as", "bot"]
 
 
 @pytest.mark.asyncio
@@ -255,7 +267,7 @@ async def test_send_reply(adapter):
         result = await adapter.send("oc_chat", "Reply!", reply_to="om_original")
         assert result.success is True
         args = mock_cli.call_args[0][0]
-        assert args == ["im", "+messages-reply", "--message-id", "om_original", "--text", "Reply!"]
+        assert args == ["im", "+messages-reply", "--message-id", "om_original", "--text", "Reply!", "--as", "bot"]
 
 
 @pytest.mark.asyncio
@@ -274,12 +286,61 @@ async def test_send_empty_content(adapter):
 
 
 # ---------------------------------------------------------------------------
+# Sender name resolution
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_resolve_sender_name_success(adapter):
+    """Successful contact lookup populates user_name in source."""
+    cli_response = json.dumps({"ok": True, "data": {"user": {"name": "张三", "en_name": "Zhang San"}}})
+    with patch("gateway.platforms.feishu.infrastructure.lark_cli_client.run_cli", new_callable=AsyncMock) as mock_cli:
+        mock_cli.return_value = (0, cli_response, "")
+        name = await adapter._resolve_sender_name("ou_user456")
+        assert name == "张三"
+        # Should be cached — second call doesn't hit CLI
+        mock_cli.reset_mock()
+        name2 = await adapter._resolve_sender_name("ou_user456")
+        assert name2 == "张三"
+        mock_cli.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_sender_name_failure(adapter):
+    """Failed contact lookup returns None without crashing."""
+    with patch("gateway.platforms.feishu.infrastructure.lark_cli_client.run_cli", new_callable=AsyncMock) as mock_cli:
+        mock_cli.return_value = (1, "", "permission denied")
+        name = await adapter._resolve_sender_name("ou_unknown")
+        assert name is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_sender_name_injects_into_source(adapter):
+    """_on_event should pass resolved name into build_source as user_name."""
+    event = {
+        "type": "im.message.receive_v1",
+        "message_id": "om_named",
+        "chat_id": "oc_chat",
+        "chat_type": "p2p",
+        "message_type": "text",
+        "content": "Hi",
+        "sender_id": "ou_user789",
+        "create_time": _recent_create_time(),
+    }
+    adapter.handle_message = AsyncMock()
+    with patch.object(adapter, "_resolve_sender_name", new_callable=AsyncMock) as mock_resolve:
+        mock_resolve.return_value = "李四"
+        await adapter._on_event(event)
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.source.user_name == "李四"
+
+
+# ---------------------------------------------------------------------------
 # Message type mapping
 # ---------------------------------------------------------------------------
 
 def test_message_type_map_coverage():
     """All expected lark-cli message types should be mapped."""
-    expected = {"text", "post", "image", "file", "audio", "video", "sticker", "interactive"}
+    expected = {"text", "post", "image", "file", "audio", "video", "sticker", "interactive", "merge_forward"}
     assert set(_MESSAGE_TYPE_MAP.keys()) == expected
 
 
@@ -298,7 +359,7 @@ async def test_image_message_downloads(adapter):
         "message_type": "image",
         "content": json.dumps({"image_key": "img_key_abc"}),
         "sender_id": "ou_user",
-        "create_time": "1700000000000",
+        "create_time": _recent_create_time(),
     }
     adapter.handle_message = AsyncMock()
     with patch.object(adapter, "_download_resource", new_callable=AsyncMock) as mock_dl:
